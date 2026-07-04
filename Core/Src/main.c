@@ -18,9 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "usbd_cdc_if.h"
 #include <stdlib.h>
 #include "LoRa.h"
 /* USER CODE END Includes */
@@ -47,13 +49,38 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 LoRa myLoRa;
-uint8_t read_data[128];
 uint8_t send_data[128];
 int			RSSI;
-uint8_t bytesRecv = 0;
 uint8_t isSend = 0;
-uint8_t uart_rx_buffer[2];
-uint8_t new_data_flag = 0;
+
+// NOWE: Bufor dla danych przychodzących z USB
+volatile uint8_t usb_rx_buffer[256];
+volatile uint16_t usb_rx_head = 0;
+volatile uint16_t usb_rx_tail = 0;
+
+// NOWE: Funkcja emulująca HAL_UART_Receive dla USB
+HAL_StatusTypeDef HAL_USB_Receive(uint8_t *pData, uint16_t Size, uint32_t Timeout)
+{
+    uint32_t tickstart = HAL_GetTick();
+    uint16_t bytes_read = 0;
+
+    while (bytes_read < Size)
+    {
+        // Sprawdź czy są nowe dane w buforze
+        if (usb_rx_head != usb_rx_tail)
+        {
+            pData[bytes_read++] = usb_rx_buffer[usb_rx_tail];
+            usb_rx_tail = (usb_rx_tail + 1) % 256;
+        }
+
+        // Sprawdzenie timeoutu
+        if ((Timeout != HAL_MAX_DELAY) && ((HAL_GetTick() - tickstart) > Timeout))
+        {
+            return HAL_TIMEOUT;
+        }
+    }
+    return HAL_OK;
+}
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -101,6 +128,7 @@ int main(void)
   MX_GPIO_Init();
   MX_SPI1_Init();
   MX_USART1_UART_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   // MODULE SETTINGS ----------------------------------------------
   	myLoRa = newLoRa();
@@ -122,41 +150,40 @@ int main(void)
 
   	// START CONTINUOUS RECEIVING -----------------------------------
   	LoRa_startReceiving(&myLoRa);
-  	send_data[0] = 0;
+  	//send_data[0] = 0;
   	//---------------------------------------------------------------
-  	HAL_UART_Transmit(&huart1, "Hello world1!", 12, HAL_MAX_DELAY);
-  	HAL_UART_Receive_IT(&huart1, uart_rx_buffer, 2);
+  	char *init_msg = "Hello world1!\r\n";
+  	CDC_Transmit_FS((uint8_t*)init_msg, strlen(init_msg));
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+	  uint8_t read_data[128];
+	  uint8_t bytesRecv = 0;
+
+	  // 1. Odbiór z LoRa i wysłanie przez USB na PC
 	  bytesRecv = LoRa_receive(&myLoRa, read_data, 128);
-	  HAL_UART_Transmit(&huart1, read_data, bytesRecv, 100);
-	  // SENDING DATA - - - - - - - - - - - - - - - - - - - - - - - - -
-	  send_data[1] = (send_data[1] + 1)%60;
-	  isSend = LoRa_transmit(&myLoRa, send_data, 1, 500) + 48;
-	  if(send_data[1] == 0){
-		  //HAL_UART_Transmit(&huart1, send_data, 1, 100);
-		  send_data[0] = (send_data[0] + 1)%3+6;
+	  if(bytesRecv > 0)
+	  {
+		  CDC_Transmit_FS(read_data, bytesRecv);
+		  // Krótkie opóźnienie, aby USB zdążyło przetworzyć pakiet przed kolejnymi operacjami
+		  HAL_Delay(2);
 	  }
 
-	  if(new_data_flag == 1) {
-		  LoRa_transmit(&myLoRa, uart_rx_buffer, 2, 500);
-		  new_data_flag = 0;
+	  // 2. Dokładnie ta sama logika co z UART – teraz przez USB
+	  read_data[0] = 8;
+
+	  // Zamiast HAL_UART_Receive używamy naszej funkcji emulującej dla USB
+	  if(HAL_USB_Receive(read_data, 1, 100) == HAL_OK){
+		  for(int i=0; i<6; i++){
+			  LoRa_transmit(&myLoRa, read_data, 1, 500);
+			  HAL_Delay(5);
+		  }
 	  }
 
-	  /*for(int i=0; i<26; i++)
-		  send_data[i+1] = 48+i;*/
-	  /*if(send_data[0] == 8){
-		  isSend = LoRa_transmit(&myLoRa, send_data, 1, 500) + 48;
-	  }*/
-	  /*HAL_UART_Transmit(&huart1, &isSend, 1, 100);*/
-	  HAL_Delay(50);
-
-	  // RECEIVING DATA - - - - - - - - - - - - - - - - - - - - - - - -
-	  //HAL_UART_Transmit(&huart1, &var, 1, 100);
+	  HAL_Delay(25);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -185,10 +212,10 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 25;
-  RCC_OscInitStruct.PLL.PLLN = 168;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLM = 15;
+  RCC_OscInitStruct.PLL.PLLN = 144;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+  RCC_OscInitStruct.PLL.PLLQ = 5;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -203,7 +230,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
@@ -312,12 +339,6 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART1) {
-    	new_data_flag = 1;
-        HAL_UART_Receive_IT(&huart1, uart_rx_buffer, 2);
-    }
-}
 
 /* USER CODE END 4 */
 
